@@ -4,9 +4,11 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
+from torch.autograd import grad
 import utils.helper_functions_PINN as hf_PINN
 import os
 import utils.fun as fun
+import copy
 
 class MyDataset(Dataset):
     def __init__(self, X, Y):
@@ -33,11 +35,10 @@ class DNN(nn.Module):
 
 class PINN:
 
-    def __init__(self, N_colloc, filename, data_loss_batch, hidden_layers):
+    def __init__(self, N_colloc, filename, hidden_layers):
 
         self.N_colloc = N_colloc
         self.filename = filename
-        self.data_loss_batch = data_loss_batch
         self.hidden_layers = hidden_layers
         self.model = []
         self.optimizer = []
@@ -130,7 +131,7 @@ class PINN:
         # strictly ≥ 0, smooth near 0; add tiny eps to avoid divide-by-zero downstream
         return F.softplus(x) + eps
     
-    def pde_loss_GPT(self, model, X_norm, x_phys, Y_min, Y_max, X_min, X_max, x_min, x_max, idx_colloc, Set, Sub, debug=False):
+    def pde_loss(self, model, X_norm, x_phys, Y_min, Y_max, X_min, X_max, x_min, x_max, idx_colloc, Set, Sub, debug=False):
         X_norm.requires_grad_(True)
         Y_pred_norm = model(X_norm)
         Y_pred = self.denormalize(Y_pred_norm, torch.tensor(Y_min, device=Y_pred_norm.device, dtype=Y_pred_norm.dtype),
@@ -149,7 +150,7 @@ class PINN:
         def grad_wrt_x(y):
             g=[]
             for i in range(y.shape[0]):
-                gi = torch.autograd.grad(y[i], X_norm, retain_graph=True, create_graph=True)[0][i,3]
+                gi = grad(y[i], X_norm, retain_graph=True, create_graph=True)[0][i,3]
                 g.append(gi)
             return torch.stack(g)*dxnorm_dxphys
         
@@ -257,7 +258,7 @@ class PINN:
 
 
 
-    def boundary_loss_GPT(self, model, X_bc_norm, X_min, X_max, Y_min, Y_max, Set):
+    def boundary_loss(self, model, X_bc_norm, X_min, X_max, Y_min, Y_max, Set):
         Y_pred_norm = model(X_bc_norm)
         Y_pred = self.denormalize(Y_pred_norm,
                         torch.tensor(Y_min, device=Y_pred_norm.device, dtype=Y_pred_norm.dtype),
@@ -289,26 +290,67 @@ class PINN:
         layers = [self.X_norm.shape[1], *self.hidden_layers, self.Y_norm.shape[1]]
         self.model = DNN(layers)
         print('\nDNN model created succesfully. Structure: ', layers, '\n')
+
+    def loss_grad_std_full(self, loss, net):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        grad_ = torch.zeros((0), dtype=torch.float32,device=device)
+        for m in net.modules():
+            if not isinstance(m, nn.Linear):
+                continue
+            if(m == 0):
+                w = grad(loss, m.weight, retain_graph=True)[0]
+                b = grad(loss, m.bias, retain_graph=True)[0]        
+                grad_ = torch.cat((w.view(-1), b))
+            else:
+                w = grad(loss, m.weight, retain_graph=True)[0]
+                b = grad(loss, m.bias, retain_graph=True)[0]        
+                grad_ = torch.cat((grad_,w.view(-1), b))
+                
+        return torch.std(grad_)
     
-    def pre_training(self, epochs, lr=1e-3):
+    def pre_training(self, epochs, lr=1e-3, data_loss_batch=32):
         self.dataset = MyDataset(self.X_norm, self.Y_norm)
-        self.dataloader = DataLoader(self.dataset, batch_size=self.data_loss_batch, shuffle=True)
+        self.dataloader = DataLoader(self.dataset, batch_size=data_loss_batch, shuffle=True)
         self.loss_data = nn.MSELoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        best_loss = float("inf")
+        patience = 4
+        patience_counter = 0
+        factor = 0.1
         self.model.train()
         print('Start of DNN model training.')
         for epoch in range(epochs):
-            total_loss = 0
+            total_loss, step = 0.0, 0.0
             for xb, yb in self.dataloader:
+                step +=1
                 self.optimizer.zero_grad()
                 preds = self.model(xb)
                 loss = self.loss_data(preds, yb)
                 loss.backward()
                 self.optimizer.step()
                 total_loss += loss.item() * xb.size(0)
-            print(f"[DNN] Epoch {epoch+1:05d}/{epochs:05d}, Loss: {total_loss/len(self.dataset):.6e}")
+            epoch_loss = total_loss / len(self.dataset)
+            print(f"[DNN] Epoch {epoch+1:05d}/{epochs:05d}, Loss: {epoch_loss:.6e}, LR: {self.optimizer.param_groups[0]['lr']:.1e}")
 
-    def training(self, epochs, lr=5e-4):
+            if epoch_loss < best_loss - 1e-8:  # small tolerance to avoid float jitter
+                best_loss = epoch_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                new_lr = self.optimizer.param_groups[0]['lr'] * factor
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = new_lr
+                print(f"⚠️  No improvement in {patience} epochs → decreasing LR to {new_lr:.1e}")
+                patience_counter = 0
+
+    def training(self, epochs, lr=5e-4, ode_loss_batch=12, bc_loss_batch=32,
+                lr_patience=4, lr_factor=0.1,       # ↓ LR by ×0.1 after 4 no-improve epochs
+                es_patience=12, min_lr=1e-6,        # early stop after 12 no-improve epochs or LR < 1e-6
+                min_delta=1e-8, alpha=0.5, mm=10):  # jitter tol, EMA alpha, lambda update period
+
+        lam_data, lam_bc, lam_ode = 1.0, 1.0, 1.0
         # Build all collocation and boundary points
         collocation_points = self.get_collocation_points(self.param_combinations, self.x_min, self.x_max, self.N_colloc)
         boundary_points = self.get_boundary_points(self.param_combinations, self.x_min)
@@ -318,26 +360,50 @@ class PINN:
         x_in = torch.from_numpy(collocation_points[:, 3]).float()
         X_bc_norm = torch.from_numpy(self.normalize_inputs(boundary_points, self.X_min, self.X_max)).float()
 
-        ode_loss_batch = self.data_loss_batch # Same batch for conistency of training in epoch loop
-        bc_loss_batch = min(len(X_bc_norm), self.data_loss_batch) # If parameter combinations fewer than data batch, use all boundary points per batch. If you have more, randomly sample 32.
+        # Move once to model device
+        device = next(self.model.parameters()).device
+        X_in_norm = X_in_norm.to(device)
+        x_in      = x_in.to(device)
+        X_bc_norm = X_bc_norm.to(device)
 
         Set, Sub = hf_PINN.sim_init()
         self.optimizer.param_groups[0]['lr'] = lr
+
+        best_loss = float('inf')
+        best_state = copy.deepcopy(self.model.state_dict())
+        no_improve_lr = 0
+        no_improve_es = 0
 
         self.model.train()
         print('Start of PINN model training.')
         for epoch in range(epochs):
             total, tot_d, tot_b, tot_o, step = 0.0, 0.0, 0.0, 0.0, 0.0
             for xb, yb in self.dataloader:
+                xb, yb = xb.to(device), yb.to(device)
                 self.optimizer.zero_grad()
                 preds = self.model(xb)
                 data_loss = self.loss_data(preds, yb)
                 # Randomly sample collocation and BC points for this batch
                 idx_bc = torch.randint(0, X_bc_norm.shape[0], (bc_loss_batch,))
-                bc_loss  = self.boundary_loss_GPT(self.model, X_bc_norm[idx_bc], self.X_min, self.X_max, self.Y_min, self.Y_max, Set)
+                bc_loss  = self.boundary_loss(self.model, X_bc_norm[idx_bc], self.X_min, self.X_max, self.Y_min, self.Y_max, Set)
                 idx_colloc = torch.randint(0, X_in_norm.shape[0], (ode_loss_batch,))               
-                ode_loss = self.pde_loss_GPT(self.model, X_in_norm[idx_colloc], x_in[idx_colloc], self.Y_min, self.Y_max, self.X_min, self.X_max, self.x_min, self.x_max, idx_colloc, Set, Sub)
-                loss = data_loss + ode_loss + bc_loss
+                ode_loss = self.pde_loss(self.model, X_in_norm[idx_colloc], x_in[idx_colloc], self.Y_min, self.Y_max, self.X_min, self.X_max, self.x_min, self.x_max, idx_colloc, Set, Sub)
+                # Compute loss balancing coefficients lambda
+                if (step % mm == 0):
+                    std_data = self.loss_grad_std_full(data_loss, self.model)
+                    std_bc = self.loss_grad_std_full(bc_loss, self.model)
+                    std_ode = self.loss_grad_std_full(ode_loss, self.model)
+                    max_std  = max(std_data, std_bc, std_ode)
+                    eps = 1e-12
+                    lam_data = alpha*lam_data + (1-alpha)*float(max_std/(std_data + eps))
+                    lam_bc   = alpha*lam_bc   + (1-alpha)*float(max_std/(std_bc   + eps))
+                    lam_ode  = alpha*lam_ode  + (1-alpha)*float(max_std/(std_ode  + eps))
+                    loss = lam_data*data_loss + lam_bc*bc_loss + lam_ode*ode_loss
+                    print(f"step: {step}, loss: {loss.item():.3e}")
+                else:
+                    loss = lam_data*data_loss + lam_bc*bc_loss + lam_ode*ode_loss
+
+                # Compute losses and backward pass
                 loss.backward()
                 self.optimizer.step()
                 step += 1
@@ -345,4 +411,39 @@ class PINN:
                 tot_b  += bc_loss.item()
                 tot_o  += ode_loss.item()
                 total  += loss.item()
-            print(f"[PINN] Epoch {epoch+1:05d}/{epochs:05d}, total={total/step:.3e} | data={tot_d/step:.3e} | bc={tot_b/step:.3e} | ode={tot_o/step:.3e}")
+            train_total = total/step
+            print(f"[PINN] Epoch {epoch+1:05d}/{epochs:05d}, "
+                f"total={train_total:.3e} | data={tot_d/step:.3e} | bc={tot_b/step:.3e} | ode={tot_o/step:.3e} "
+                f"| LR={self.optimizer.param_groups[0]['lr']:.1e} | λ=[{lam_data:.2f},{lam_bc:.2f},{lam_ode:.2f}]")
+
+             # Improvement check on the optimization objective (weighted total)
+
+            if train_total < best_loss - min_delta:
+                best_loss = train_total
+                best_state = copy.deepcopy(self.model.state_dict())
+                no_improve_lr = 0
+                no_improve_es = 0
+            else:
+                no_improve_lr += 1
+                no_improve_es += 1
+
+            # LR reduction on plateau
+            if no_improve_lr >= lr_patience:
+                new_lr = self.optimizer.param_groups[0]['lr'] * lr_factor
+                for g in self.optimizer.param_groups:
+                    g['lr'] = new_lr
+                print(f"↘️  No improvement in {lr_patience} epochs → decreasing LR to {new_lr:.1e}")
+                no_improve_lr = 0
+
+            # Early stopping
+            if no_improve_es >= es_patience:
+                print(f"🛑 Early stopping: no improvement in {es_patience} epochs. Restoring best weights.")
+                self.model.load_state_dict(best_state)
+                return
+            if self.optimizer.param_groups[0]['lr'] < min_lr:
+                print(f"🛑 Early stopping: LR fell below {min_lr:.1e}. Restoring best weights.")
+                self.model.load_state_dict(best_state)
+                return
+
+        # training finished — restore best weights (optional but common)
+        self.model.load_state_dict(best_state)
