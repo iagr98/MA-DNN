@@ -155,7 +155,7 @@ class PINN:
             return torch.stack(g)*dxnorm_dxphys
         
         # enforce non-negativity for physics & compute grads on these transformed vars
-        V_dis = self._pos(V_dis); V_c = self._pos(V_c); phi_32 = self._pos(phi_32); N_j = self._pos(N_j)
+        # V_dis = self._pos(V_dis); V_c = self._pos(V_c); phi_32 = self._pos(phi_32); N_j = self._pos(N_j)
         
         dV_dis_dx  = grad_wrt_x(V_dis)
         dV_c_dx    = grad_wrt_x(V_c)
@@ -252,8 +252,11 @@ class PINN:
         # eq4: watch orientation (we made v_sj as [N, N_d])
         eq4 = -(u_c.unsqueeze(1) * dN_dx + N_j * du_c_dx.unsqueeze(1)) - N_j * (v_sj / h_c.unsqueeze(1))
 
-        res_loss = eq1.pow(2).mean() + eq2.pow(2).mean() + eq3.pow(2).mean() + eq4.pow(2).mean()
-        return res_loss
+        vol_loss_res = eq1.pow(2).mean() + eq2.pow(2).mean()
+        phi_loss_res = eq3.pow(2).mean()
+        N_j_loss_res = eq4.pow(2).mean()
+
+        return vol_loss_res, phi_loss_res, N_j_loss_res
 
 
 
@@ -263,7 +266,7 @@ class PINN:
         Y_pred = self.denormalize(Y_pred_norm,
                         torch.tensor(Y_min, device=Y_pred_norm.device, dtype=Y_pred_norm.dtype),
                         torch.tensor(Y_max, device=Y_pred_norm.device, dtype=Y_pred_norm.dtype))
-        Y_pred = self._pos(Y_pred)  # make all components ≥ 0 before comparing to BC targets
+        # Y_pred = self._pos(Y_pred)  # make all components ≥ 0 before comparing to BC targets
         V_dis_0, V_c_0 = hf_PINN.get_parameters_boundary(Set)
         X_bc = self.denormalize(X_bc_norm, torch.tensor(X_min), torch.tensor(X_max))
         eps_0 = X_bc[:,1].numpy()
@@ -282,8 +285,10 @@ class PINN:
         bc_target[:,2] = phi_0    # phi_32(x=0)
         bc_target[:,3:] = N_j_0   # N_j(x=0)
 
-        bc_loss = ((Y_pred[:,:3] - bc_target[:,:3])**2).mean() + ((Y_pred[:,3:] - bc_target[:,3:])**2).mean()
-        return bc_loss
+        vol_loss_bc = ((Y_pred[:,:2] - bc_target[:,:2])**2).mean()
+        phi_loss_bc = ((Y_pred[:,2] - bc_target[:,2])**2).mean()
+        N_j_loss_bc = ((Y_pred[:,3:] - bc_target[:,3:])**2).mean()
+        return vol_loss_bc, phi_loss_bc, N_j_loss_bc
     
     def create_model(self):
         self.X_norm, self.Y_norm, self.X_min, self.X_max, self.Y_min, self.Y_max, self.param_combinations, self.x_min, self.x_max = self.create_normalized_data(self.filename)
@@ -348,9 +353,11 @@ class PINN:
     def training(self, epochs, lr=5e-4, ode_loss_batch=12, bc_loss_batch=32,
                 lr_patience=4, lr_factor=0.1,       # ↓ LR by ×0.1 after 4 no-improve epochs
                 es_patience=12, min_lr=1e-6,        # early stop after 12 no-improve epochs or LR < 1e-6
-                min_delta=1e-8, alpha=0.5, mm=10):  # jitter tol, EMA alpha, lambda update period
+                min_delta=1e-8, alpha=0.5, mm=10000000):  # jitter tol, EMA alpha, lambda update period
 
-        lam_data, lam_bc, lam_ode = 1.0, 1.0, 1.0
+        lam_data = 1.0
+        lam_vol_bc, lam_phi_bc, lam_N_j_bc = 1.0, 1.0, 1.0
+        lam_vol_ode, lam_phi_ode, lam_N_j_ode = 1.0, 1.0, 1.0
         # Build all collocation and boundary points
         collocation_points = self.get_collocation_points(self.param_combinations, self.x_min, self.x_max, self.N_colloc)
         boundary_points = self.get_boundary_points(self.param_combinations, self.x_min)
@@ -382,39 +389,52 @@ class PINN:
                 xb, yb = xb.to(device), yb.to(device)
                 self.optimizer.zero_grad()
                 preds = self.model(xb)
-                data_loss = self.loss_data(preds, yb)
+                loss_data = self.loss_data(preds, yb)
                 # Randomly sample collocation and BC points for this batch
                 idx_bc = torch.randint(0, X_bc_norm.shape[0], (bc_loss_batch,))
-                bc_loss  = self.boundary_loss(self.model, X_bc_norm[idx_bc], self.X_min, self.X_max, self.Y_min, self.Y_max, Set)
+                loss_vol_bc, loss_phi_bc, loss_N_j_bc  = self.boundary_loss(self.model, X_bc_norm[idx_bc], self.X_min, self.X_max, self.Y_min, self.Y_max, Set)
                 idx_colloc = torch.randint(0, X_in_norm.shape[0], (ode_loss_batch,))               
-                ode_loss = self.pde_loss(self.model, X_in_norm[idx_colloc], x_in[idx_colloc], self.Y_min, self.Y_max, self.X_min, self.X_max, self.x_min, self.x_max, idx_colloc, Set, Sub)
+                loss_vol_ode, loss_phi_ode, loss_N_j_ode = self.pde_loss(self.model, X_in_norm[idx_colloc], x_in[idx_colloc], self.Y_min, self.Y_max, self.X_min, self.X_max, self.x_min, self.x_max, idx_colloc, Set, Sub)
                 # Compute loss balancing coefficients lambda
                 if (step % mm == 0):
-                    std_data = self.loss_grad_std_full(data_loss, self.model)
-                    std_bc = self.loss_grad_std_full(bc_loss, self.model)
-                    std_ode = self.loss_grad_std_full(ode_loss, self.model)
-                    max_std  = max(std_data, std_bc, std_ode)
+                    std_data = self.loss_grad_std_full(loss_data, self.model)
+                    std_vol_bc = self.loss_grad_std_full(loss_vol_bc, self.model)
+                    std_phi_bc = self.loss_grad_std_full(loss_phi_bc, self.model)
+                    std_N_j_bc = self.loss_grad_std_full(loss_N_j_bc, self.model)
+                    std_vol_ode = self.loss_grad_std_full(loss_vol_ode, self.model)
+                    std_phi_ode = self.loss_grad_std_full(loss_phi_ode, self.model)
+                    std_N_j_ode = self.loss_grad_std_full(loss_N_j_ode, self.model)
+                    max_std  = max(std_data, std_vol_bc, std_phi_bc, std_N_j_bc, std_vol_ode, std_phi_ode, std_N_j_ode)
                     eps = 1e-12
                     lam_data = alpha*lam_data + (1-alpha)*float(max_std/(std_data + eps))
-                    lam_bc   = alpha*lam_bc   + (1-alpha)*float(max_std/(std_bc   + eps))
-                    lam_ode  = alpha*lam_ode  + (1-alpha)*float(max_std/(std_ode  + eps))
-                    loss = lam_data*data_loss + lam_bc*bc_loss + lam_ode*ode_loss
+                    lam_vol_bc   = alpha*lam_vol_bc   + (1-alpha)*float(max_std/(std_vol_bc   + eps))
+                    lam_phi_bc   = alpha*lam_phi_bc   + (1-alpha)*float(max_std/(std_phi_bc   + eps))
+                    lam_N_j_bc   = alpha*lam_N_j_bc   + (1-alpha)*float(max_std/(std_N_j_bc   + eps))
+                    lam_vol_ode  = alpha*lam_vol_ode  + (1-alpha)*float(max_std/(std_vol_ode  + eps))
+                    lam_phi_ode  = alpha*lam_phi_ode  + (1-alpha)*float(max_std/(std_phi_ode  + eps))
+                    lam_N_j_ode  = alpha*lam_N_j_ode  + (1-alpha)*float(max_std/(std_N_j_ode  + eps))
+                    loss = lam_data*loss_data + lam_vol_bc*loss_vol_bc + lam_phi_bc*loss_phi_bc + lam_N_j_bc*loss_N_j_bc + lam_vol_ode*loss_vol_ode + lam_phi_ode*loss_phi_ode + lam_N_j_ode*loss_N_j_ode
+                    print(f"loss_data: {loss_data.item():.3e}, loss_vol_bc: {loss_vol_bc.item():.3e}, loss_phi_bc: {loss_phi_bc.item():.3e}, loss_N_j_bc: {loss_N_j_bc.item():.3e}, loss_vol_ode: {loss_vol_ode.item():.3e}, loss_phi_ode: {loss_phi_ode.item():.3e}, loss_N_j_ode: {loss_N_j_ode.item():.3e}")
+                    print(f"lam_data: {lam_data:.2f}, lam_vol_bc: {lam_vol_bc:.2f}, lam_phi_bc: {lam_phi_bc:.2f}, lam_N_j_bc: {lam_N_j_bc:.2f}, lam_vol_ode: {lam_vol_ode:.2f}, lam_phi_ode: {lam_phi_ode:.2f}, lam_N_j_ode: {lam_N_j_ode:.2f}")
+                    # print scaled losses
+                    print(f"scaled loss_data: {lam_data*loss_data.item():.3e}, scaled loss_vol_bc: {lam_vol_bc*loss_vol_bc.item():.3e}, scaled loss_phi_bc: {lam_phi_bc*loss_phi_bc.item():.3e}, scaled loss_N_j_bc: {lam_N_j_bc*loss_N_j_bc.item():.3e}, scaled loss_vol_ode: {lam_vol_ode*loss_vol_ode.item():.3e}, scaled loss_phi_ode: {lam_phi_ode*loss_phi_ode.item():.3e}, scaled loss_N_j_ode: {lam_N_j_ode*loss_N_j_ode.item():.3e}")
                     print(f"step: {step}, loss: {loss.item():.3e}")
                 else:
-                    loss = lam_data*data_loss + lam_bc*bc_loss + lam_ode*ode_loss
-
+                    loss = lam_data*loss_data + lam_vol_bc*loss_vol_bc + lam_phi_bc*loss_phi_bc + lam_N_j_bc*loss_N_j_bc + lam_vol_ode*loss_vol_ode + lam_phi_ode*loss_phi_ode + lam_N_j_ode*loss_N_j_ode
+                    print(f"loss_data: {loss_data.item():.3e}, loss_vol_bc: {loss_vol_bc.item():.3e}, loss_phi_bc: {loss_phi_bc.item():.3e}, loss_N_j_bc: {loss_N_j_bc.item():.3e}, loss_vol_ode: {loss_vol_ode.item():.3e}, loss_phi_ode: {loss_phi_ode.item():.3e}, loss_N_j_ode: {loss_N_j_ode.item():.3e}")
+                    print(f"lam_data: {lam_data:.2f}, lam_vol_bc: {lam_vol_bc:.2f}, lam_phi_bc: {lam_phi_bc:.2f}, lam_N_j_bc: {lam_N_j_bc:.2f}, lam_vol_ode: {lam_vol_ode:.2f}, lam_phi_ode: {lam_phi_ode:.2f}, lam_N_j_ode: {lam_N_j_ode:.2f}")
                 # Compute losses and backward pass
                 loss.backward()
                 self.optimizer.step()
                 step += 1
-                tot_d  += data_loss.item()
-                tot_b  += bc_loss.item()
-                tot_o  += ode_loss.item()
+                tot_d  += loss_data.item()
+                tot_b  += loss_vol_bc.item() + loss_phi_bc.item() + loss_N_j_bc.item()
+                tot_o  += loss_vol_ode.item() + loss_phi_ode.item() + loss_N_j_ode.item()
                 total  += loss.item()
             train_total = total/step
             print(f"[PINN] Epoch {epoch+1:05d}/{epochs:05d}, "
                 f"total={train_total:.3e} | data={tot_d/step:.3e} | bc={tot_b/step:.3e} | ode={tot_o/step:.3e} "
-                f"| LR={self.optimizer.param_groups[0]['lr']:.1e} | λ=[{lam_data:.2f},{lam_bc:.2f},{lam_ode:.2f}]")
+                f"| LR={self.optimizer.param_groups[0]['lr']:.1e} | λ=[{lam_data:.2f},{lam_vol_bc:.2f},{lam_phi_bc:.2f},{lam_N_j_bc:.2f},{lam_vol_ode:.2f},{lam_phi_ode:.2f},{lam_N_j_ode:.2f}]")
 
              # Improvement check on the optimization objective (weighted total)
 
