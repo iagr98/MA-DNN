@@ -106,7 +106,7 @@ class input_simulation:
             h_c = hf.getHeight(V_c / dl, D / 2)
             V_s = np.sum((N_j * v_sed / h_c) * (np.pi/6) * d_j**3)
         else:
-            print('V_c negative!')
+            print('V_c negative!', V_c)
         return V_s
     
     def source_term_32(self, V_dis, V_c, phi_32, N_j):

@@ -54,6 +54,8 @@ class PINN:
         self.param_combinations = []
         self.x_min = 0
         self.x_max = 0
+        self.residuals_scales = None
+        self.tau = 0
 
 
     def create_normalized_data(self, filename):
@@ -127,9 +129,8 @@ class PINN:
             boundary_points.append([dV_ges, eps_0, phi_0, x_min])
         return np.array(boundary_points)
 
-    def _pos(self, x, eps=1e-12):
-        # strictly ≥ 0, smooth near 0; add tiny eps to avoid divide-by-zero downstream
-        return F.softplus(x) + eps
+    def _pos(self, x, beta=20000.0):
+        return F.softplus(x, beta=beta)
     
     def pde_loss(self, model, X_norm, x_phys, Y_min, Y_max, X_min, X_max, x_min, x_max, idx_colloc, Set, Sub, debug=False):
         X_norm.requires_grad_(True)
@@ -244,17 +245,42 @@ class PINN:
             print("All shapes look good ✅")
             print("-----------------------------------")
 
-        # Residuals
+        if getattr(self, "res_scales", None) is None:
+            def rms(x):  # robust scalar magnitude, no grad
+                return torch.sqrt(torch.mean(x.detach()**2) + 1e-24)
+            
+            # Characteristic scales per equation (built from the equation's own terms)
+            S1 = rms(u_dis * dV_dis_dx) + rms(V_dis * du_dis_dx) + rms(dV_coal) + rms((1/Sub.eps_p) * dV_sed)
+            S2 = rms(u_c   * dV_c_dx)   + rms(V_c   * du_c_dx)   + rms((1-Sub.eps_p) * dV_coal) + rms((1/Sub.eps_p) * dV_sed)
+            S3 = rms(u_dis * dphi32_dx) + rms(phi_32 * du_dis_dx) + rms(phi_32/(6*tau_dd)) + rms(S_32)
+            S4_j = (
+                rms(u_c.unsqueeze(1) * dN_dx) +
+                rms(N_j * du_c_dx.unsqueeze(1)) +
+                rms(N_j * (v_sj / h_c.unsqueeze(1)))
+            )  # shape (N_d,)
+
+            # clamp other scales to be safe
+            S1 = torch.clamp(S1, 1e-12, 1e12)
+            S2 = torch.clamp(S2, 1e-12, 1e12)
+            S3 = torch.clamp(S3, 1e-12, 1e12)
+            S4_j = torch.clamp(S4_j, 1e-12, 1e12)
+            self.res_scales = (S1, S2, S3, S4_j)
+        S1, S2, S3, S4_j = self.res_scales
+
+        # Residuals with physical units
         eq1 = -(u_dis * dV_dis_dx + V_dis * du_dis_dx) - dV_coal + (1/eps_p)*dV_sed
         eq2 = -(u_c   * dV_c_dx   + V_c   * du_c_dx)   + (1-eps_p)*dV_coal - (1/eps_p)*dV_sed
         eq3 = -(u_dis * dphi32_dx + phi_32 * du_dis_dx) + phi_32/(6*tau_dd) + S_32
-
-        # eq4: watch orientation (we made v_sj as [N, N_d])
         eq4 = -(u_c.unsqueeze(1) * dN_dx + N_j * du_c_dx.unsqueeze(1)) - N_j * (v_sj / h_c.unsqueeze(1))
 
-        vol_loss_res = eq1.pow(2).mean() + eq2.pow(2).mean()
-        phi_loss_res = eq3.pow(2).mean()
-        N_j_loss_res = eq4.pow(2).mean()
+        eq1_n = eq1 / S1
+        eq2_n = eq2 / S2
+        eq3_n = eq3 / S3
+        eq4_n = eq4 / S4_j.unsqueeze(0)
+
+        vol_loss_res = eq1_n.pow(2).mean() + eq2_n.pow(2).mean()
+        phi_loss_res = eq3_n.pow(2).mean()
+        N_j_loss_res = eq4_n.pow(2).mean()
 
         return vol_loss_res, phi_loss_res, N_j_loss_res
 
@@ -285,9 +311,15 @@ class PINN:
         bc_target[:,2] = phi_0    # phi_32(x=0)
         bc_target[:,3:] = N_j_0   # N_j(x=0)
 
-        vol_loss_bc = ((Y_pred[:,:2] - bc_target[:,:2])**2).mean()
-        phi_loss_bc = ((Y_pred[:,2] - bc_target[:,2])**2).mean()
-        N_j_loss_bc = ((Y_pred[:,3:] - bc_target[:,3:])**2).mean()
+        eps = 1e-12
+        V_ref  = torch.sqrt((bc_target[:,:2]**2).mean())      # scalar for volumes
+        phi_ref= torch.sqrt((bc_target[:,2]**2).mean())
+        N_ref  = torch.sqrt((bc_target[:,3:]**2).mean(dim=0, keepdim=True))  # per-class
+
+        vol_loss_bc = (((Y_pred[:,:2] - bc_target[:,:2]) / (V_ref + eps))**2).mean()
+        phi_loss_bc = (((Y_pred[:,2]  - bc_target[:,2])  / (phi_ref + eps))**2).mean()
+        N_j_loss_bc = ((((Y_pred[:,3:] - bc_target[:,3:]) / (N_ref + eps))**2)).mean()
+
         return vol_loss_bc, phi_loss_bc, N_j_loss_bc
     
     def create_model(self):
@@ -312,6 +344,49 @@ class PINN:
                 grad_ = torch.cat((grad_,w.view(-1), b))
                 
         return torch.std(grad_)
+    
+
+    def dynamic_scaling_scheme(self, losses, scheme='inverse_dirichlet', alpha=0.9, eps=1e-12, tau=None):
+        """
+        Dynamically compute scaling factors (lambdas) for each loss term.
+
+        """
+        
+        if (scheme == 'inverse_dirichlet'):
+            stds = [self.loss_grad_std_full(loss, self.model) for loss in losses] # Step 1: Compute gradient std for each loss
+            max_std = max(stds)            # Step 2: Find max std
+            if not hasattr(self, '_prev_lambdas'):  # Step 3: If no previous lambdas, initialize to 1
+                self._prev_lambdas = [1.0 for _ in losses]
+            # Step 4: Update lambdas using inverse Dirichlet rule
+            new_lambdas = [] 
+            for prev_lam, std in zip(self._prev_lambdas, stds):
+                updated_lam = alpha * prev_lam + (1 - alpha) * float(max_std / (std + eps))
+                new_lambdas.append(updated_lam)
+            self._prev_lambdas = new_lambdas   # Store updated lambdas for next call
+            return new_lambdas
+        
+        elif (scheme == 'softadapt'):
+            if tau is None:
+                tau = getattr(self, 'softadapt_tau', 5.0)
+            cur_losses = torch.tensor([float(l.detach().item()) for l in losses])
+            if not hasattr(self, '_softadapt_prev_losses'):
+                self._softadapt_prev_losses = cur_losses.clone()
+            prev_losses = self._softadapt_prev_losses
+            z = tau * (cur_losses - prev_losses)              # could be large/small
+            w = F.softmax(z, dim=0)              # numerically stable
+            gain = len(w)
+            target_weights = gain * w
+            if not hasattr(self, '_prev_lambdas'):
+                self._prev_lambdas = [1.0 for _ in losses]
+            prev_lam = torch.tensor(self._prev_lambdas, dtype=target_weights.dtype)
+            new_lambdas = alpha * prev_lam + (1.0 - alpha) * target_weights
+            self._prev_lambdas = new_lambdas.tolist()
+            self._softadapt_prev_losses = cur_losses.clone()
+            return self._prev_lambdas
+
+        else:
+            raise ValueError(f"Unknown scheme: {scheme}")
+
     
     def pre_training(self, epochs, lr=1e-3, data_loss_batch=32):
         self.dataset = MyDataset(self.X_norm, self.Y_norm)
@@ -353,7 +428,8 @@ class PINN:
     def training(self, epochs, lr=5e-4, ode_loss_batch=12, bc_loss_batch=32,
                 lr_patience=4, lr_factor=0.1,       # ↓ LR by ×0.1 after 4 no-improve epochs
                 es_patience=12, min_lr=1e-6,        # early stop after 12 no-improve epochs or LR < 1e-6
-                min_delta=1e-8, alpha=0.5, mm=10000000):  # jitter tol, EMA alpha, lambda update period
+                balancing_scheme='inverse_dirichlet',
+                min_delta=1e-8, alpha=0.9, mm=10, tau=None): 
 
         lam_data = 1.0
         lam_vol_bc, lam_phi_bc, lam_N_j_bc = 1.0, 1.0, 1.0
@@ -383,6 +459,7 @@ class PINN:
 
         self.model.train()
         print('Start of PINN model training.')
+        print('Loss balancing scheme:', balancing_scheme)
         for epoch in range(epochs):
             total, tot_d, tot_b, tot_o, step = 0.0, 0.0, 0.0, 0.0, 0.0
             for xb, yb in self.dataloader:
@@ -397,32 +474,18 @@ class PINN:
                 loss_vol_ode, loss_phi_ode, loss_N_j_ode = self.pde_loss(self.model, X_in_norm[idx_colloc], x_in[idx_colloc], self.Y_min, self.Y_max, self.X_min, self.X_max, self.x_min, self.x_max, idx_colloc, Set, Sub)
                 # Compute loss balancing coefficients lambda
                 if (step % mm == 0):
-                    std_data = self.loss_grad_std_full(loss_data, self.model)
-                    std_vol_bc = self.loss_grad_std_full(loss_vol_bc, self.model)
-                    std_phi_bc = self.loss_grad_std_full(loss_phi_bc, self.model)
-                    std_N_j_bc = self.loss_grad_std_full(loss_N_j_bc, self.model)
-                    std_vol_ode = self.loss_grad_std_full(loss_vol_ode, self.model)
-                    std_phi_ode = self.loss_grad_std_full(loss_phi_ode, self.model)
-                    std_N_j_ode = self.loss_grad_std_full(loss_N_j_ode, self.model)
-                    max_std  = max(std_data, std_vol_bc, std_phi_bc, std_N_j_bc, std_vol_ode, std_phi_ode, std_N_j_ode)
-                    eps = 1e-12
-                    lam_data = alpha*lam_data + (1-alpha)*float(max_std/(std_data + eps))
-                    lam_vol_bc   = alpha*lam_vol_bc   + (1-alpha)*float(max_std/(std_vol_bc   + eps))
-                    lam_phi_bc   = alpha*lam_phi_bc   + (1-alpha)*float(max_std/(std_phi_bc   + eps))
-                    lam_N_j_bc   = alpha*lam_N_j_bc   + (1-alpha)*float(max_std/(std_N_j_bc   + eps))
-                    lam_vol_ode  = alpha*lam_vol_ode  + (1-alpha)*float(max_std/(std_vol_ode  + eps))
-                    lam_phi_ode  = alpha*lam_phi_ode  + (1-alpha)*float(max_std/(std_phi_ode  + eps))
-                    lam_N_j_ode  = alpha*lam_N_j_ode  + (1-alpha)*float(max_std/(std_N_j_ode  + eps))
+                    lam_data, lam_vol_bc, lam_phi_bc, lam_N_j_bc, lam_vol_ode, lam_phi_ode, lam_N_j_ode = self.dynamic_scaling_scheme(
+                        [loss_data, loss_vol_bc, loss_phi_bc, loss_N_j_bc, loss_vol_ode, loss_phi_ode, loss_N_j_ode],
+                        scheme=balancing_scheme, alpha=alpha, tau=tau, eps=1e-12
+                    )
+                    # Print losses and lambdas for debugging
+
                     loss = lam_data*loss_data + lam_vol_bc*loss_vol_bc + lam_phi_bc*loss_phi_bc + lam_N_j_bc*loss_N_j_bc + lam_vol_ode*loss_vol_ode + lam_phi_ode*loss_phi_ode + lam_N_j_ode*loss_N_j_ode
                     print(f"loss_data: {loss_data.item():.3e}, loss_vol_bc: {loss_vol_bc.item():.3e}, loss_phi_bc: {loss_phi_bc.item():.3e}, loss_N_j_bc: {loss_N_j_bc.item():.3e}, loss_vol_ode: {loss_vol_ode.item():.3e}, loss_phi_ode: {loss_phi_ode.item():.3e}, loss_N_j_ode: {loss_N_j_ode.item():.3e}")
                     print(f"lam_data: {lam_data:.2f}, lam_vol_bc: {lam_vol_bc:.2f}, lam_phi_bc: {lam_phi_bc:.2f}, lam_N_j_bc: {lam_N_j_bc:.2f}, lam_vol_ode: {lam_vol_ode:.2f}, lam_phi_ode: {lam_phi_ode:.2f}, lam_N_j_ode: {lam_N_j_ode:.2f}")
-                    # print scaled losses
-                    print(f"scaled loss_data: {lam_data*loss_data.item():.3e}, scaled loss_vol_bc: {lam_vol_bc*loss_vol_bc.item():.3e}, scaled loss_phi_bc: {lam_phi_bc*loss_phi_bc.item():.3e}, scaled loss_N_j_bc: {lam_N_j_bc*loss_N_j_bc.item():.3e}, scaled loss_vol_ode: {lam_vol_ode*loss_vol_ode.item():.3e}, scaled loss_phi_ode: {lam_phi_ode*loss_phi_ode.item():.3e}, scaled loss_N_j_ode: {lam_N_j_ode*loss_N_j_ode.item():.3e}")
                     print(f"step: {step}, loss: {loss.item():.3e}")
                 else:
                     loss = lam_data*loss_data + lam_vol_bc*loss_vol_bc + lam_phi_bc*loss_phi_bc + lam_N_j_bc*loss_N_j_bc + lam_vol_ode*loss_vol_ode + lam_phi_ode*loss_phi_ode + lam_N_j_ode*loss_N_j_ode
-                    print(f"loss_data: {loss_data.item():.3e}, loss_vol_bc: {loss_vol_bc.item():.3e}, loss_phi_bc: {loss_phi_bc.item():.3e}, loss_N_j_bc: {loss_N_j_bc.item():.3e}, loss_vol_ode: {loss_vol_ode.item():.3e}, loss_phi_ode: {loss_phi_ode.item():.3e}, loss_N_j_ode: {loss_N_j_ode.item():.3e}")
-                    print(f"lam_data: {lam_data:.2f}, lam_vol_bc: {lam_vol_bc:.2f}, lam_phi_bc: {lam_phi_bc:.2f}, lam_N_j_bc: {lam_N_j_bc:.2f}, lam_vol_ode: {lam_vol_ode:.2f}, lam_phi_ode: {lam_phi_ode:.2f}, lam_N_j_ode: {lam_N_j_ode:.2f}")
                 # Compute losses and backward pass
                 loss.backward()
                 self.optimizer.step()
