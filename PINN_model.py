@@ -54,8 +54,9 @@ class PINN:
         self.param_combinations = []
         self.x_min = 0
         self.x_max = 0
-        self.residuals_scales = None
+        self.res_scales = None
         self.tau = 0
+        self.losses_vector = []
 
 
     def create_normalized_data(self, filename):
@@ -481,9 +482,9 @@ class PINN:
                     # Print losses and lambdas for debugging
 
                     loss = lam_data*loss_data + lam_vol_bc*loss_vol_bc + lam_phi_bc*loss_phi_bc + lam_N_j_bc*loss_N_j_bc + lam_vol_ode*loss_vol_ode + lam_phi_ode*loss_phi_ode + lam_N_j_ode*loss_N_j_ode
-                    print(f"loss_data: {loss_data.item():.3e}, loss_vol_bc: {loss_vol_bc.item():.3e}, loss_phi_bc: {loss_phi_bc.item():.3e}, loss_N_j_bc: {loss_N_j_bc.item():.3e}, loss_vol_ode: {loss_vol_ode.item():.3e}, loss_phi_ode: {loss_phi_ode.item():.3e}, loss_N_j_ode: {loss_N_j_ode.item():.3e}")
-                    print(f"lam_data: {lam_data:.2f}, lam_vol_bc: {lam_vol_bc:.2f}, lam_phi_bc: {lam_phi_bc:.2f}, lam_N_j_bc: {lam_N_j_bc:.2f}, lam_vol_ode: {lam_vol_ode:.2f}, lam_phi_ode: {lam_phi_ode:.2f}, lam_N_j_ode: {lam_N_j_ode:.2f}")
-                    print(f"step: {step}, loss: {loss.item():.3e}")
+                    # print(f"loss_data: {loss_data.item():.3e}, loss_vol_bc: {loss_vol_bc.item():.3e}, loss_phi_bc: {loss_phi_bc.item():.3e}, loss_N_j_bc: {loss_N_j_bc.item():.3e}, loss_vol_ode: {loss_vol_ode.item():.3e}, loss_phi_ode: {loss_phi_ode.item():.3e}, loss_N_j_ode: {loss_N_j_ode.item():.3e}")
+                    # print(f"lam_data: {lam_data:.2f}, lam_vol_bc: {lam_vol_bc:.2f}, lam_phi_bc: {lam_phi_bc:.2f}, lam_N_j_bc: {lam_N_j_bc:.2f}, lam_vol_ode: {lam_vol_ode:.2f}, lam_phi_ode: {lam_phi_ode:.2f}, lam_N_j_ode: {lam_N_j_ode:.2f}")
+                    # print(f"step: {step}, loss: {loss.item():.3e}")
                 else:
                     loss = lam_data*loss_data + lam_vol_bc*loss_vol_bc + lam_phi_bc*loss_phi_bc + lam_N_j_bc*loss_N_j_bc + lam_vol_ode*loss_vol_ode + lam_phi_ode*loss_phi_ode + lam_N_j_ode*loss_N_j_ode
                 # Compute losses and backward pass
@@ -498,7 +499,8 @@ class PINN:
             print(f"[PINN] Epoch {epoch+1:05d}/{epochs:05d}, "
                 f"total={train_total:.3e} | data={tot_d/step:.3e} | bc={tot_b/step:.3e} | ode={tot_o/step:.3e} "
                 f"| LR={self.optimizer.param_groups[0]['lr']:.1e} | λ=[{lam_data:.2f},{lam_vol_bc:.2f},{lam_phi_bc:.2f},{lam_N_j_bc:.2f},{lam_vol_ode:.2f},{lam_phi_ode:.2f},{lam_N_j_ode:.2f}]")
-
+            self.losses_vector.append((train_total, tot_d/step, loss_vol_bc.item()/step, loss_phi_bc.item()/step, loss_N_j_bc.item()/step,
+                                       loss_vol_ode.item()/step, loss_phi_ode.item()/step, loss_N_j_ode.item()/step))
              # Improvement check on the optimization objective (weighted total)
 
             if train_total < best_loss - min_delta:
