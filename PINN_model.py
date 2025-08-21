@@ -87,11 +87,6 @@ class PINN:
         Y = np.array(output_list, dtype=np.float32)
         Y = np.maximum(Y, 0)  # Set negative values to 0
 
-        # Remove all-zero output columns automatically
-        # col_nonzero = np.any(Y != 0, axis=0)
-        # Y = Y[:, col_nonzero]
-        # kept_output_cols = np.where(col_nonzero)[0]  # Save mapping for later
-
         # Min-max normalization for inputs
         X_min, X_max = X.min(axis=0), X.max(axis=0)
         X_norm = (X - X_min) / (X_max - X_min + 1e-8)
@@ -246,42 +241,15 @@ class PINN:
             print("All shapes look good ✅")
             print("-----------------------------------")
 
-        if getattr(self, "res_scales", None) is None:
-            def rms(x):  # robust scalar magnitude, no grad
-                return torch.sqrt(torch.mean(x.detach()**2) + 1e-24)
-            
-            # Characteristic scales per equation (built from the equation's own terms)
-            S1 = rms(u_dis * dV_dis_dx) + rms(V_dis * du_dis_dx) + rms(dV_coal) + rms((1/Sub.eps_p) * dV_sed)
-            S2 = rms(u_c   * dV_c_dx)   + rms(V_c   * du_c_dx)   + rms((1-Sub.eps_p) * dV_coal) + rms((1/Sub.eps_p) * dV_sed)
-            S3 = rms(u_dis * dphi32_dx) + rms(phi_32 * du_dis_dx) + rms(phi_32/(6*tau_dd)) + rms(S_32)
-            S4_j = (
-                rms(u_c.unsqueeze(1) * dN_dx) +
-                rms(N_j * du_c_dx.unsqueeze(1)) +
-                rms(N_j * (v_sj / h_c.unsqueeze(1)))
-            )  # shape (N_d,)
-
-            # clamp other scales to be safe
-            S1 = torch.clamp(S1, 1e-12, 1e12)
-            S2 = torch.clamp(S2, 1e-12, 1e12)
-            S3 = torch.clamp(S3, 1e-12, 1e12)
-            S4_j = torch.clamp(S4_j, 1e-12, 1e12)
-            self.res_scales = (S1, S2, S3, S4_j)
-        S1, S2, S3, S4_j = self.res_scales
-
         # Residuals with physical units
         eq1 = -(u_dis * dV_dis_dx + V_dis * du_dis_dx) - dV_coal + (1/eps_p)*dV_sed
         eq2 = -(u_c   * dV_c_dx   + V_c   * du_c_dx)   + (1-eps_p)*dV_coal - (1/eps_p)*dV_sed
         eq3 = -(u_dis * dphi32_dx + phi_32 * du_dis_dx) + phi_32/(6*tau_dd) + S_32
         eq4 = -(u_c.unsqueeze(1) * dN_dx + N_j * du_c_dx.unsqueeze(1)) - N_j * (v_sj / h_c.unsqueeze(1))
 
-        eq1_n = eq1 / S1
-        eq2_n = eq2 / S2
-        eq3_n = eq3 / S3
-        eq4_n = eq4 / S4_j.unsqueeze(0)
-
-        vol_loss_res = eq1_n.pow(2).mean() + eq2_n.pow(2).mean()
-        phi_loss_res = eq3_n.pow(2).mean()
-        N_j_loss_res = eq4_n.pow(2).mean()
+        vol_loss_res = eq1.pow(2).mean() + eq2.pow(2).mean()
+        phi_loss_res = eq3.pow(2).mean()
+        N_j_loss_res = eq4.pow(2).mean()
 
         return vol_loss_res, phi_loss_res, N_j_loss_res
 
