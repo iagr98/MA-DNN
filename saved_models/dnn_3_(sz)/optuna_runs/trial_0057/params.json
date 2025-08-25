@@ -1,0 +1,12 @@
+{
+  "n_layers": 2,
+  "width_l1": 128,
+  "width_l2": 512,
+  "activation": "relu",
+  "dropout": 0.1177899144442333,
+  "lr": 0.0009928230090859493,
+  "weight_decay": 1.314896896028906e-07,
+  "batch_size": 64,
+  "optimizer": "adamw",
+  "max_epochs": 135
+}

@@ -5,9 +5,9 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 from torch.autograd import grad
-import utils.helper_functions_PINN as hf_PINN
+import utils.utils_pinn.helper_functions_PINN as hf_PINN
 import os
-import utils.fun as fun
+import utils.utils_pinn.fun as fun
 import copy
 
 class MyDataset(Dataset):

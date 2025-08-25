@@ -1,4 +1,4 @@
-from PINN_model import PINN
+from pinn_training.PINN_model import PINN
 
 N_colloc = 21
 filename = 'in_silico_dataset.csv'

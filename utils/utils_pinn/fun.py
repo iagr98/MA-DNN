@@ -35,7 +35,7 @@ def get_tau_x(L,A,q):
 
 def get_A_x(r,h_w):
     import numpy as np
-    import utils.constants as constants
+    import utils.utils_pinn.constants as constants
     # crosssectional area (normal vector in x direction) of separator dependent on height of water h_w and radius of separator r
     if h_w >= 2*r - constants.EPS:
         return np.pi*r**2
@@ -47,7 +47,7 @@ def get_A_y(r,h_i,dL):
     # crosssectional area (normal vector in y direction) of interface dependent on height of interface h_i and radius of separator r for axial segment length dL
     # catch error if h_i is smaller eq. zero (no DGTS in separator)
     import numpy as np
-    import utils.constants as constants
+    import utils.utils_pinn.constants as constants
     root = h_i*(2*r - h_i)
     if root < constants.EPS:
         return 2*dL*constants.EPS
@@ -237,7 +237,7 @@ def get_sauter_mean_diameter_stirrer(We):
     see Kraume 2004 et al.
     '''
     import numpy as np
-    import utils.constants as constants
+    import utils.utils_pinn.constants as constants
     c_2 = 1 # constant depending on stirrer geometry
     n = 0.6 # for breakage dominant mixing processes
     d_32 = constants.D_STIRRER*c_2*(We)**(n)
@@ -304,7 +304,7 @@ def initialize_boundary_conditions(epsilon_in, d_32, d_max, path, N_D, plot=Fals
     output: d_bins: bin center of droplet classes in m
     output: N_in_total: total number of droplets entering the separator in 1
     '''
-    import utils.constants as constants
+    import utils.utils_pinn.constants as constants
     V_mix = get_A_x(constants.R, 2*constants.R)*constants.L/constants.N_S
     N_in_total, n_in_rel, d_bins = get_totalNumber_water_inlet(epsilon_in,d_32,d_max=d_max, V_mix=V_mix, path=path, N_D=N_D) # total number of droplets at inlet
     # relative dropsize distribution at inlet
@@ -341,7 +341,7 @@ def calculate_separator(y,u,p):
     output: dV_si: volume flow rate of sedimentation in each segment
     output: dn_dp: number of droplets leaving segment from dense-packed zone
     '''
-    import utils.constants as constants
+    import utils.utils_pinn.constants as constants
     import numpy as np
     
     # assign diff variables

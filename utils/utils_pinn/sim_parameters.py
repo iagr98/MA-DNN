@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
-from utils import helper_functions as hf
+from utils.utils_pinn import helper_functions as hf
 
 # Settings-Objekt beinhaltet Simulationsparameter und Abscheidergeometrie
 

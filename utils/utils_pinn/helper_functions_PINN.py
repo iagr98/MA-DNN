@@ -4,9 +4,9 @@ from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-import utils.sim_parameters as sp
-import utils.sim_model_PINN as mm # mm for mechanistic model
-import utils.fun as fun
+import utils.utils_pinn.sim_parameters as sp
+import utils.utils_pinn.sim_model_PINN as mm # mm for mechanistic model
+import utils.utils_pinn.fun as fun
 
 # Funktion berechnet Höhe eines Kreissegments auf Basis des Kreisradius r und der Fläche A
 def getHeight(A, r):

@@ -1,6 +1,6 @@
 import numpy as np
-import utils.helper_functions as hf
-from utils.helper_functions import getHeightArray
+import utils.utils_pinn.helper_functions as hf
+from utils.utils_pinn.helper_functions import getHeightArray
 
 
 class input_simulation:
