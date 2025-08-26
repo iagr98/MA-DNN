@@ -1,0 +1,14 @@
+{
+  "n_layers": 4,
+  "width_l1": 128,
+  "width_l2": 384,
+  "width_l3": 128,
+  "width_l4": 192,
+  "activation": "silu",
+  "dropout": 0.13539437181910835,
+  "lr": 0.0010442382218196458,
+  "weight_decay": 1.3616948565452096e-08,
+  "batch_size": 64,
+  "optimizer": "adamw",
+  "max_epochs": 197
+}

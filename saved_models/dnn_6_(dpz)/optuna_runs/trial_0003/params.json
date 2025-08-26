@@ -1,0 +1,14 @@
+{
+  "n_layers": 4,
+  "width_l1": 512,
+  "width_l2": 128,
+  "width_l3": 192,
+  "width_l4": 384,
+  "activation": "tanh",
+  "dropout": 0.4303652916281717,
+  "lr": 1.0404501336028154e-05,
+  "weight_decay": 1.160068983900714e-05,
+  "batch_size": 64,
+  "optimizer": "adam",
+  "max_epochs": 168
+}
