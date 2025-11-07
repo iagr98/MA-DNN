@@ -3,26 +3,6 @@
 This repository contains the datasets, trained models, and Jupyter notebooks used to develop and evaluate two deep neural network (DNN) models for predicting **separator performance indicators** — namely **DPZ** and **λ**.  
 The repository is organized to ensure reproducibility and transparency of the data-driven modeling workflow.
 
----
-
-## Repository Structure
-
-├── Input/
-│ ├── df_dpz.csv
-│ ├── df_lam.csv
-│ ├── sz.csv
-│ └── ye.csv
-│
-├── saved_models/
-│ ├── dnn_(dpz)/
-│ │ └── dnn_dpz.pt ...
-│ └── dnn_(lam)/
-│ └── dnn_lam.pt ...
-│
-├── dnn_dpz.ipynb
-├── dnn_lam.ipynb
-└── README.md
-
 
 ---
 
