@@ -1,0 +1,13 @@
+{
+  "n_layers": 3,
+  "width_l1": 512,
+  "width_l2": 512,
+  "width_l3": 384,
+  "activation": "gelu",
+  "dropout": 0.021933802875545166,
+  "lr": 0.002502144137409699,
+  "weight_decay": 1.8021225589544238e-06,
+  "batch_size": 128,
+  "optimizer": "adam",
+  "max_epochs": 217
+}
